@@ -102,11 +102,18 @@ func FromLLB(op *pb.Op_Source, platform *pb.Platform) (Identifier, error) {
 					id.KeepGitDir = true
 				}
 			case pb.AttrFullRemoteURL:
+				if !isGitTransport(v) {
+					v = "https://" + v
+				}
 				id.Remote = v
 			case pb.AttrAuthHeaderSecret:
 				id.AuthHeaderSecret = v
 			case pb.AttrAuthTokenSecret:
 				id.AuthTokenSecret = v
+			case pb.AttrKnownSSHHosts:
+				id.KnownSSHHosts = v
+			case pb.AttrMountSSHSock:
+				id.MountSSHSock = v
 			}
 		}
 	}

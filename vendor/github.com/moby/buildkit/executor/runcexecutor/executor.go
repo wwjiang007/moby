@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/mount"
 	containerdoci "github.com/containerd/containerd/oci"
 	"github.com/containerd/continuity/fs"
@@ -43,9 +42,10 @@ type Opt struct {
 	ProcessMode     oci.ProcessMode
 	IdentityMapping *idtools.IdentityMapping
 	// runc run --no-pivot (unrecommended)
-	NoPivot     bool
-	DNS         *oci.DNSConfig
-	OOMScoreAdj *int
+	NoPivot         bool
+	DNS             *oci.DNSConfig
+	OOMScoreAdj     *int
+	ApparmorProfile string
 }
 
 var defaultCommandCandidates = []string{"buildkit-runc", "runc"}
@@ -63,6 +63,7 @@ type runcExecutor struct {
 	oomScoreAdj      *int
 	running          map[string]chan error
 	mu               sync.Mutex
+	apparmorProfile  string
 }
 
 func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Executor, error) {
@@ -125,6 +126,7 @@ func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Ex
 		dns:              opt.DNS,
 		oomScoreAdj:      opt.OOMScoreAdj,
 		running:          make(map[string]chan error),
+		apparmorProfile:  opt.ApparmorProfile,
 	}
 	return w, nil
 }
@@ -254,7 +256,7 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 		}
 		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
 	}
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.processMode, w.idmap, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.processMode, w.idmap, w.apparmorProfile, opts...)
 	if err != nil {
 		return err
 	}
@@ -335,7 +337,7 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 func exitError(ctx context.Context, err error) error {
 	if err != nil {
 		exitErr := &errdefs.ExitError{
-			ExitCode: containerd.UnknownExitStatus,
+			ExitCode: errdefs.ContainerdUnknownExitStatus,
 			Err:      err,
 		}
 		var runcExitError *runc.ExitError

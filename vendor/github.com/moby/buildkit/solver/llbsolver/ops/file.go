@@ -15,6 +15,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/llbsolver"
+	"github.com/moby/buildkit/solver/llbsolver/errdefs"
 	"github.com/moby/buildkit/solver/llbsolver/file"
 	"github.com/moby/buildkit/solver/llbsolver/ops/fileoptypes"
 	"github.com/moby/buildkit/solver/pb"
@@ -44,7 +45,7 @@ func NewFileOp(v solver.Vertex, op *pb.Op_File, cm cache.Manager, md *metadata.S
 		md:        md,
 		numInputs: len(v.Inputs()),
 		w:         w,
-		solver:    NewFileOpSolver(&file.Backend{}, file.NewRefManager(cm)),
+		solver:    NewFileOpSolver(w, &file.Backend{}, file.NewRefManager(cm)),
 	}, nil
 }
 
@@ -59,6 +60,8 @@ func (f *fileOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 			invalidSelectors[int(idx)] = struct{}{}
 		}
 	}
+
+	indexes := make([][]int, 0, len(f.op.Actions))
 
 	for _, action := range f.op.Actions {
 		var dt []byte
@@ -102,14 +105,21 @@ func (f *fileOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 		}
 
 		actions = append(actions, dt)
+		indexes = append(indexes, []int{int(action.Input), int(action.SecondaryInput), int(action.Output)})
+	}
+
+	if isDefaultIndexes(indexes) {
+		indexes = nil
 	}
 
 	dt, err := json.Marshal(struct {
 		Type    string
 		Actions [][]byte
+		Indexes [][]int `json:"indexes,omitempty"`
 	}{
 		Type:    fileCacheType,
 		Actions: actions,
+		Indexes: indexes,
 	})
 	if err != nil {
 		return nil, false, err
@@ -258,8 +268,9 @@ func processOwner(chopt *pb.ChownOpt, selectors map[int]map[llbsolver.Selector]s
 	return nil
 }
 
-func NewFileOpSolver(b fileoptypes.Backend, r fileoptypes.RefManager) *FileOpSolver {
+func NewFileOpSolver(w worker.Worker, b fileoptypes.Backend, r fileoptypes.RefManager) *FileOpSolver {
 	return &FileOpSolver{
+		w:    w,
 		b:    b,
 		r:    r,
 		outs: map[int]int{},
@@ -268,6 +279,7 @@ func NewFileOpSolver(b fileoptypes.Backend, r fileoptypes.RefManager) *FileOpSol
 }
 
 type FileOpSolver struct {
+	w worker.Worker
 	b fileoptypes.Backend
 	r fileoptypes.RefManager
 
@@ -343,7 +355,7 @@ func (s *FileOpSolver) Solve(ctx context.Context, inputs []fileoptypes.Ref, acti
 				}
 				inp, err := s.getInput(ctx, idx, inputs, actions, g)
 				if err != nil {
-					return err
+					return errdefs.WithFileActionError(err, idx-len(inputs))
 				}
 				outs[i] = inp.ref
 				return nil
@@ -401,17 +413,40 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 
 		var inpMount, inpMountSecondary fileoptypes.Mount
 		var toRelease []fileoptypes.Mount
-		var inpMountPrepared bool
+		action := actions[idx-len(inputs)]
+
 		defer func() {
+			if err != nil && inpMount != nil {
+				inputRes := make([]solver.Result, len(inputs))
+				for i, input := range inputs {
+					inputRes[i] = worker.NewWorkerRefResult(input.(cache.ImmutableRef), s.w)
+				}
+
+				outputRes := make([]solver.Result, len(actions))
+
+				// Commit the mutable for the primary input of the failed action.
+				if !inpMount.Readonly() {
+					ref, cerr := s.r.Commit(ctx, inpMount)
+					if cerr == nil {
+						outputRes[idx-len(inputs)] = worker.NewWorkerRefResult(ref.(cache.ImmutableRef), s.w)
+					}
+				}
+
+				// If the action has a secondary input, commit it and set the ref on
+				// the output results.
+				if inpMountSecondary != nil && !inpMountSecondary.Readonly() {
+					ref2, cerr := s.r.Commit(ctx, inpMountSecondary)
+					if cerr == nil {
+						outputRes[int(action.SecondaryInput)-len(inputs)] = worker.NewWorkerRefResult(ref2.(cache.ImmutableRef), s.w)
+					}
+				}
+
+				err = errdefs.WithExecError(err, inputRes, outputRes)
+			}
 			for _, m := range toRelease {
 				m.Release(context.TODO())
 			}
-			if err != nil && inpMount != nil && inpMountPrepared {
-				inpMount.Release(context.TODO())
-			}
 		}()
-
-		action := actions[idx-len(inputs)]
 
 		loadInput := func(ctx context.Context) func() error {
 			return func() error {
@@ -425,7 +460,6 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 						return err
 					}
 					inpMount = m
-					inpMountPrepared = true
 					return nil
 				}
 				inpMount = inp.mount
@@ -524,7 +558,6 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 				return nil, err
 			}
 			inpMount = m
-			inpMountPrepared = true
 		}
 
 		switch a := action.Action.(type) {
@@ -585,4 +618,40 @@ func (s *FileOpSolver) getInput(ctx context.Context, idx int, inputs []fileoptyp
 		return input{}, err
 	}
 	return inp.(input), err
+}
+
+func isDefaultIndexes(idxs [][]int) bool {
+	// Older version of checksum did not contain indexes for actions resulting in possibility for a wrong cache match.
+	// We detect the most common pattern for indexes and maintain old checksum for that case to minimize cache misses on upgrade.
+	// If a future change causes braking changes in instruction cache consider removing this exception.
+	if len(idxs) == 0 {
+		return false
+	}
+
+	for i, idx := range idxs {
+		if len(idx) != 3 {
+			return false
+		}
+		// input for first action is first input
+		if i == 0 && idx[0] != 0 {
+			return false
+		}
+		// input for other actions is previous action
+		if i != 0 && idx[0] != len(idxs)+(i-1) {
+			return false
+		}
+		// secondary input is second input or -1
+		if idx[1] != -1 && idx[1] != 1 {
+			return false
+		}
+		// last action creates output
+		if i == len(idxs)-1 && idx[2] != 0 {
+			return false
+		}
+		// other actions do not create an output
+		if i != len(idxs)-1 && idx[2] != -1 {
+			return false
+		}
+	}
+	return true
 }

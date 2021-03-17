@@ -22,6 +22,7 @@ import (
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/registry"
 	metrics "github.com/docker/go-metrics"
+	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
 )
 
@@ -188,7 +189,7 @@ func (daemon *Daemon) fillSecurityOptions(v *types.Info, sysInfo *sysinfo.SysInf
 		}
 		securityOptions = append(securityOptions, fmt.Sprintf("name=seccomp,profile=%s", profile))
 	}
-	if selinuxEnabled() {
+	if selinux.GetEnabled() {
 		securityOptions = append(securityOptions, "name=selinux")
 	}
 	if rootIDs := daemon.idMapping.RootPair(); rootIDs.UID != 0 || rootIDs.GID != 0 {
@@ -208,7 +209,7 @@ func (daemon *Daemon) fillAPIInfo(v *types.Info) {
 	const warn string = `
          Access to the remote API is equivalent to root access on the host. Refer
          to the 'Docker daemon attack surface' section in the documentation for
-         more information: https://docs.docker.com/engine/security/security/#docker-daemon-attack-surface`
+         more information: https://docs.docker.com/go/attack-surface/`
 
 	cfg := daemon.configStore
 	for _, host := range cfg.Hosts {

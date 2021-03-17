@@ -343,16 +343,19 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 		dgst        digest.Digest
 		mt          string
 		size        int64
+		tagged      reference.NamedTagged
+		isTagged    bool
 	)
 	if digested, isDigested := ref.(reference.Canonical); isDigested {
 		dgst = digested.Digest()
 		tagOrDigest = digested.String()
-	} else if tagged, isTagged := ref.(reference.NamedTagged); isTagged {
+	} else if tagged, isTagged = ref.(reference.NamedTagged); isTagged {
 		tagService := p.repo.Tags(ctx)
 		desc, err := tagService.Get(ctx, tagged.Tag())
 		if err != nil {
 			return false, allowV1Fallback(err)
 		}
+
 		dgst = desc.Digest
 		tagOrDigest = tagged.Tag()
 		mt = desc.MediaType
@@ -367,13 +370,40 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 			"remote": ref,
 		}))
 
-	manifest, err := p.manifestStore.Get(ctx, specs.Descriptor{
+	desc := specs.Descriptor{
 		MediaType: mt,
 		Digest:    dgst,
 		Size:      size,
-	})
+	}
+	manifest, err := p.manifestStore.Get(ctx, desc)
 	if err != nil {
-		return false, err
+		if isTagged && isNotFound(errors.Cause(err)) {
+			logrus.WithField("ref", ref).WithError(err).Debug("Falling back to pull manifest by tag")
+
+			msg := `%s Failed to pull manifest by the resolved digest. This registry does not
+	appear to conform to the distribution registry specification; falling back to
+	pull by tag.  This fallback is DEPRECATED, and will be removed in a future
+	release.  Please contact admins of %s. %s
+`
+
+			warnEmoji := "\U000026A0\U0000FE0F"
+			progress.Messagef(p.config.ProgressOutput, "WARNING", msg, warnEmoji, p.endpoint.URL, warnEmoji)
+
+			// Fetch by tag worked, but fetch by digest didn't.
+			// This is a broken registry implementation.
+			// We'll fallback to the old behavior and get the manifest by tag.
+			var ms distribution.ManifestService
+			ms, err = p.repo.Manifests(ctx)
+			if err != nil {
+				return false, err
+			}
+
+			manifest, err = ms.Get(ctx, "", distribution.WithTag(tagged.Tag()))
+			err = errors.Wrap(err, "error after falling back to get manifest by tag")
+		}
+		if err != nil {
+			return false, err
+		}
 	}
 
 	if manifest == nil {
@@ -498,6 +528,9 @@ func (p *v2Puller) pullSchema1(ctx context.Context, ref reference.Reference, unv
 	// to top-most, so that the downloads slice gets ordered correctly.
 	for i := len(verifiedManifest.FSLayers) - 1; i >= 0; i-- {
 		blobSum := verifiedManifest.FSLayers[i].BlobSum
+		if err = blobSum.Validate(); err != nil {
+			return "", "", errors.Wrapf(err, "could not validate layer digest %q", blobSum)
+		}
 
 		var throwAway struct {
 			ThrowAway bool `json:"throwaway,omitempty"`
@@ -596,6 +629,9 @@ func (p *v2Puller) pullSchema2Layers(ctx context.Context, target distribution.De
 	// Note that the order of this loop is in the direction of bottom-most
 	// to top-most, so that the downloads slice gets ordered correctly.
 	for _, d := range layers {
+		if err := d.Digest.Validate(); err != nil {
+			return "", errors.Wrapf(err, "could not validate layer digest %q", d.Digest)
+		}
 		layerDescriptor := &v2LayerDescriptor{
 			digest:            d.Digest,
 			repo:              p.repo,
@@ -818,11 +854,12 @@ func (p *v2Puller) pullManifestList(ctx context.Context, ref reference.Named, mf
 		return "", "", err
 	}
 
-	manifest, err := p.manifestStore.Get(ctx, specs.Descriptor{
+	desc := specs.Descriptor{
 		Digest:    match.Digest,
 		Size:      match.Size,
 		MediaType: match.MediaType,
-	})
+	}
+	manifest, err := p.manifestStore.Get(ctx, desc)
 	if err != nil {
 		return "", "", err
 	}

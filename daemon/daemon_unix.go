@@ -45,6 +45,7 @@ import (
 	lntypes "github.com/docker/libnetwork/types"
 	"github.com/moby/sys/mount"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -460,7 +461,7 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 		resources.MemoryReservation = 0
 	}
 	if resources.MemoryReservation > 0 && resources.MemoryReservation < linuxMinMemory {
-		return warnings, fmt.Errorf("Minimum memory reservation allowed is 4MB")
+		return warnings, fmt.Errorf("Minimum memory reservation allowed is 6MB")
 	}
 	if resources.Memory > 0 && resources.MemoryReservation > 0 && resources.Memory < resources.MemoryReservation {
 		return warnings, fmt.Errorf("Minimum memory limit can not be less than memory reservation limit, see usage")
@@ -746,6 +747,9 @@ func verifyDaemonSettings(conf *config.Config) error {
 	if !conf.BridgeConfig.EnableIPTables && !conf.BridgeConfig.InterContainerCommunication {
 		return fmt.Errorf("You specified --iptables=false with --icc=false. ICC=false uses iptables to function. Please set --icc or --iptables to true")
 	}
+	if conf.BridgeConfig.EnableIP6Tables && !conf.Experimental {
+		return fmt.Errorf("ip6tables rules are only available if experimental features are enabled")
+	}
 	if !conf.BridgeConfig.EnableIPTables && conf.BridgeConfig.EnableIPMasq {
 		conf.BridgeConfig.EnableIPMasq = false
 	}
@@ -819,7 +823,7 @@ func overlaySupportsSelinux() (bool, error) {
 // configureKernelSecuritySupport configures and validates security support for the kernel
 func configureKernelSecuritySupport(config *config.Config, driverName string) error {
 	if config.EnableSelinuxSupport {
-		if !selinuxEnabled() {
+		if !selinux.GetEnabled() {
 			logrus.Warn("Docker could not enable SELinux on the host system")
 			return nil
 		}
@@ -837,7 +841,7 @@ func configureKernelSecuritySupport(config *config.Config, driverName string) er
 			}
 		}
 	} else {
-		selinuxSetDisabled()
+		selinux.SetDisabled()
 	}
 	return nil
 }
@@ -911,6 +915,7 @@ func driverOptions(config *config.Config) []nwconfig.Option {
 	bridgeConfig := options.Generic{
 		"EnableIPForwarding":  config.BridgeConfig.EnableIPForward,
 		"EnableIPTables":      config.BridgeConfig.EnableIPTables,
+		"EnableIP6Tables":     config.BridgeConfig.EnableIP6Tables,
 		"EnableUserlandProxy": config.BridgeConfig.EnableUserlandProxy,
 		"UserlandProxyPath":   config.BridgeConfig.UserlandProxyPath}
 	bridgeOption := options.Generic{netlabel.GenericData: bridgeConfig}
@@ -1191,7 +1196,7 @@ func setupRemappedRoot(config *config.Config) (*idtools.IdentityMapping, error) 
 	return &idtools.IdentityMapping{}, nil
 }
 
-func setupDaemonRoot(config *config.Config, rootDir string, rootIdentity idtools.Identity) error {
+func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools.Identity) error {
 	config.Root = rootDir
 	// the docker root metadata directory needs to have execute permissions for all users (g+x,o+x)
 	// so that syscalls executing as non-root, operating on subdirectories of the graph root
@@ -1216,10 +1221,16 @@ func setupDaemonRoot(config *config.Config, rootDir string, rootIdentity idtools
 	// a new subdirectory with ownership set to the remapped uid/gid (so as to allow
 	// `chdir()` to work for containers namespaced to that uid/gid)
 	if config.RemappedRoot != "" {
-		config.Root = filepath.Join(rootDir, fmt.Sprintf("%d.%d", rootIdentity.UID, rootIdentity.GID))
+		id := idtools.CurrentIdentity()
+		// First make sure the current root dir has the correct perms.
+		if err := idtools.MkdirAllAndChown(config.Root, 0701, id); err != nil {
+			return errors.Wrapf(err, "could not create or set daemon root permissions: %s", config.Root)
+		}
+
+		config.Root = filepath.Join(rootDir, fmt.Sprintf("%d.%d", remappedRoot.UID, remappedRoot.GID))
 		logrus.Debugf("Creating user namespaced daemon root: %s", config.Root)
 		// Create the root directory if it doesn't exist
-		if err := idtools.MkdirAllAndChown(config.Root, 0700, rootIdentity); err != nil {
+		if err := idtools.MkdirAllAndChown(config.Root, 0701, id); err != nil {
 			return fmt.Errorf("Cannot create daemon root: %s: %v", config.Root, err)
 		}
 		// we also need to verify that any pre-existing directories in the path to
@@ -1232,7 +1243,7 @@ func setupDaemonRoot(config *config.Config, rootDir string, rootIdentity idtools
 			if dirPath == "/" {
 				break
 			}
-			if !idtools.CanAccess(dirPath, rootIdentity) {
+			if !idtools.CanAccess(dirPath, remappedRoot) {
 				return fmt.Errorf("a subdirectory in your graphroot path (%s) restricts access to the remapped root uid/gid; please fix by allowing 'o+x' permissions on existing directories", config.Root)
 			}
 		}

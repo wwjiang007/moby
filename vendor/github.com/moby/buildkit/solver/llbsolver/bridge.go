@@ -11,15 +11,14 @@ import (
 	"github.com/mitchellh/hashstructure"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/client/llb"
-	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/frontend"
 	gw "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/errdefs"
+	llberrdefs "github.com/moby/buildkit/solver/llbsolver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/flightcontrol"
-	"github.com/moby/buildkit/util/tracing"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -125,6 +124,10 @@ func (b *llbBridge) Solve(ctx context.Context, req frontend.SolveRequest, sid st
 
 	if req.Definition != nil && req.Definition.Def != nil {
 		res = &frontend.Result{Ref: newResultProxy(b, req)}
+		if req.Evaluate {
+			_, err := res.Ref.Result(ctx)
+			return res, err
+		}
 	} else if req.Frontend != "" {
 		f, ok := b.frontends[req.Frontend]
 		if !ok {
@@ -142,41 +145,60 @@ func (b *llbBridge) Solve(ctx context.Context, req frontend.SolveRequest, sid st
 }
 
 type resultProxy struct {
-	cb       func(context.Context) (solver.CachedResult, error)
-	def      *pb.Definition
-	g        flightcontrol.Group
-	mu       sync.Mutex
-	released bool
-	v        solver.CachedResult
-	err      error
+	cb         func(context.Context) (solver.CachedResult, error)
+	def        *pb.Definition
+	g          flightcontrol.Group
+	mu         sync.Mutex
+	released   bool
+	v          solver.CachedResult
+	err        error
+	errResults []solver.Result
 }
 
 func newResultProxy(b *llbBridge, req frontend.SolveRequest) *resultProxy {
-	return &resultProxy{
+	rp := &resultProxy{
 		def: req.Definition,
-		cb: func(ctx context.Context) (solver.CachedResult, error) {
-			return b.loadResult(ctx, req.Definition, req.CacheImports)
-		},
 	}
+	rp.cb = func(ctx context.Context) (solver.CachedResult, error) {
+		res, err := b.loadResult(ctx, req.Definition, req.CacheImports)
+		var ee *llberrdefs.ExecError
+		if errors.As(err, &ee) {
+			ee.EachRef(func(res solver.Result) error {
+				rp.errResults = append(rp.errResults, res)
+				return nil
+			})
+			// acquire ownership so ExecError finalizer doesn't attempt to release as well
+			ee.OwnerBorrowed = true
+		}
+		return res, err
+	}
+	return rp
 }
 
 func (rp *resultProxy) Definition() *pb.Definition {
 	return rp.def
 }
 
-func (rp *resultProxy) Release(ctx context.Context) error {
+func (rp *resultProxy) Release(ctx context.Context) (err error) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
+	for _, res := range rp.errResults {
+		rerr := res.Release(ctx)
+		if rerr != nil {
+			err = rerr
+		}
+	}
 	if rp.v != nil {
 		if rp.released {
 			logrus.Warnf("release of already released result")
 		}
-		if err := rp.v.Release(ctx); err != nil {
-			return err
+		rerr := rp.v.Release(ctx)
+		if err != nil {
+			return rerr
 		}
 	}
 	rp.released = true
-	return nil
+	return
 }
 
 func (rp *resultProxy) wrapError(err error) error {
@@ -242,28 +264,6 @@ func (rp *resultProxy) Result(ctx context.Context) (res solver.CachedResult, err
 		return r.(solver.CachedResult), nil
 	}
 	return nil, err
-}
-
-func (b *llbBridge) Run(ctx context.Context, id string, root executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (err error) {
-	w, err := b.resolveWorker()
-	if err != nil {
-		return err
-	}
-	span, ctx := tracing.StartSpan(ctx, strings.Join(process.Meta.Args, " "))
-	err = w.Executor().Run(ctx, id, root, mounts, process, started)
-	tracing.FinishWithError(span, err)
-	return err
-}
-
-func (b *llbBridge) Exec(ctx context.Context, id string, process executor.ProcessInfo) (err error) {
-	w, err := b.resolveWorker()
-	if err != nil {
-		return err
-	}
-	span, ctx := tracing.StartSpan(ctx, strings.Join(process.Meta.Args, " "))
-	err = w.Executor().Exec(ctx, id, process)
-	tracing.FinishWithError(span, err)
-	return err
 }
 
 func (b *llbBridge) ResolveImageConfig(ctx context.Context, ref string, opt llb.ResolveImageConfigOpt) (dgst digest.Digest, config []byte, err error) {
