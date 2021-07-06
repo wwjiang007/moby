@@ -28,14 +28,14 @@ if ! [ -w $XDG_RUNTIME_DIR ]; then
 	echo "XDG_RUNTIME_DIR needs to be set and writable"
 	exit 1
 fi
-if ! [ -w $HOME ]; then
-	echo "HOME needs to be set and writable"
+if ! [ -d $HOME ]; then
+	echo "HOME needs to be set and exist."
 	exit 1
 fi
 
 rootlesskit=""
 for f in docker-rootlesskit rootlesskit; do
-	if which $f > /dev/null 2>&1; then
+	if command -v $f > /dev/null 2>&1; then
 		rootlesskit=$f
 		break
 	fi
@@ -53,7 +53,7 @@ fi
 net=$DOCKERD_ROOTLESS_ROOTLESSKIT_NET
 mtu=$DOCKERD_ROOTLESS_ROOTLESSKIT_MTU
 if [ -z $net ]; then
-	if which slirp4netns > /dev/null 2>&1; then
+	if command -v slirp4netns > /dev/null 2>&1; then
 		# If --netns-type is present in --help, slirp4netns is >= v0.4.0.
 		if slirp4netns --help | grep -qw -- --netns-type; then
 			net=slirp4netns
@@ -65,7 +65,7 @@ if [ -z $net ]; then
 		fi
 	fi
 	if [ -z $net ]; then
-		if which vpnkit > /dev/null 2>&1; then
+		if command -v vpnkit > /dev/null 2>&1; then
 			net=vpnkit
 		else
 			echo "Either slirp4netns (>= v0.4.0) or vpnkit needs to be installed"
@@ -83,6 +83,12 @@ if [ -z $_DOCKERD_ROOTLESS_CHILD ]; then
 	if [ "$(id -u)" = "0" ]; then
 		echo "This script must be executed as a non-privileged user"
 		exit 1
+	fi
+	# `selinuxenabled` always returns false in RootlessKit child, so we execute `selinuxenabled` in the parent.
+	# https://github.com/rootless-containers/rootlesskit/issues/94
+	if command -v selinuxenabled > /dev/null 2>&1 && selinuxenabled; then
+		_DOCKERD_ROOTLESS_SELINUX=1
+		export _DOCKERD_ROOTLESS_SELINUX
 	fi
 	# Re-exec the script via RootlessKit, so as to create unprivileged {user,mount,network} namespaces.
 	#
@@ -105,5 +111,12 @@ else
 	# remove the symlinks for the existing files in the parent namespace if any,
 	# so that we can create our own files in our mount namespace.
 	rm -f /run/docker /run/containerd /run/xtables.lock
+
+	if [ -n "$_DOCKERD_ROOTLESS_SELINUX" ]; then
+		# iptables requires /run in the child to be relabeled. The actual /run in the parent is unaffected.
+		# https://github.com/containers/podman/blob/e6fc34b71aa9d876b1218efe90e14f8b912b0603/libpod/networking_linux.go#L396-L401
+		# https://github.com/moby/moby/issues/41230
+		chcon system_u:object_r:iptables_var_run_t:s0 /run
+	fi
 	exec dockerd $@
 fi
